@@ -24,6 +24,8 @@ use crate::cache::redis::RedisCache;
 #[cfg(feature = "s3")]
 use crate::cache::s3::S3Cache;
 use crate::config::{self, CacheType, Config};
+use crate::futures::Future;
+use futures::future;
 use futures_cpupool::CpuPool;
 use std::fmt;
 use std::fs;
@@ -139,24 +141,43 @@ impl CacheRead {
     where
         T: IntoIterator<Item = (String, PathBuf)> + Send + Sync + 'static,
     {
-        Box::new(pool.spawn_fn(move || {
-            for (key, path) in objects {
-                let dir = match path.parent() {
-                    Some(d) => d,
-                    None => bail!("Output file without a parent directory!"),
-                };
-                // Write the cache entry to a tempfile and then atomically
-                // move it to its final location so that other rustc invocations
-                // happening in parallel don't see a partially-written file.
-                let mut tmp = NamedTempFile::new_in(dir)?;
-                let mode = self.get_object(&key, &mut tmp)?;
-                tmp.persist(&path)?;
-                if let Some(mode) = mode {
-                    set_file_mode(&path, mode)?;
-                }
-            }
-            Ok(())
-        }))
+        let pool_cloned = pool.clone();
+        Box::new(
+            pool.spawn_fn(move || {
+                future::result(
+                    objects
+                        .into_iter()
+                        .map(|(key, path)| {
+                            let mut contents = Vec::new();
+                            let mode = self.get_object(&key, &mut contents)?;
+                            Ok((contents, mode, path, pool_cloned.clone()))
+                        })
+                        .collect::<Result<Vec<_>>>(),
+                )
+            })
+            .and_then(|vs| {
+                future::join_all(vs.into_iter().map(|(contents, mode, path, pool)| {
+                    pool.spawn_fn(move || {
+                        let dir = match path.parent() {
+                            Some(d) => d,
+                            None => bail!("Output file without a parent directory!"),
+                        };
+                        // Write the cache entry to a tempfile and then atomically
+                        // move it to its final location so that other rustc
+                        // invocations happening in parallel don't see a
+                        // partially-written file.
+                        let mut tmp = NamedTempFile::new_in(dir)?;
+                        io::copy(&mut &contents[..], &mut tmp)?;
+                        tmp.persist(&path)?;
+                        if let Some(mode) = mode {
+                            set_file_mode(&path, mode)?;
+                        }
+                        Ok(())
+                    })
+                }))
+            })
+            .map(|_| ()),
+        )
     }
 }
 
